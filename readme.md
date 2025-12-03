@@ -7,7 +7,7 @@
 3. Follow the instructions:
    - Choose a name for your bot (e.g., "My VibeTune Bot")
    - Choose a username (e.g., "my_vibetune_bot")
-4. Copy the bot token (looks like: `8332478522:AAEpwTXfBFlirazWtz93pPAqiHYqb8pf4eo)
+4. Copy the bot token (looks like: `67t7878700:gy8ugih98t78t788)
 
 ### 2. Install Dependencies
 
