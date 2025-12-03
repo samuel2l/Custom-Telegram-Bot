@@ -1,8 +1,4 @@
-# Telegram Bot Setup Guide
-
-Complete guide to run your VibeTune Telegram bot with Modal finetuned models.
-
-## Quick Start
+# TELEGRAM BOT USING MODAL FINETUNED MODELS
 
 ### 1. Get a Telegram Bot Token
 
@@ -17,11 +13,6 @@ Complete guide to run your VibeTune Telegram bot with Modal finetuned models.
 
 Install Python dependencies:
 
-```bash
-pip install -r requirements.txt
-```
-
-Or install manually:
 
 ```bash
 pip install python-telegram-bot requests
@@ -38,10 +29,10 @@ Export these variables:
 
 ```bash
 # Required - Get from @BotFather
-export TELEGRAM_BOT_TOKEN=8332478522:AAEpwTXfBFlirazWtz93pPAqiHYqb8pf4eo
+export TELEGRAM_BOT_TOKEN=your_telegram_bot_father_token
 
 # Optional - Defaults to your Modal URL
-export MODAL_INFERENCE_URL=https://affum3331--vibetune-inference-inferenceservice-serve.modal.run
+export MODAL_INFERENCE_URL=your_modal_inference_url
 
 # Optional - Set a default finetuned model to use
 export DEFAULT_MODEL_ID=training-12345
@@ -58,18 +49,11 @@ export DEFAULT_TOP_P=0.9
 python telegram_bot.py
 ```
 
-Or make it executable and run directly:
-
-```bash
-chmod +x telegram_bot.py
-./telegram_bot.py
-```
-
 You should see:
 ```
 🤖 VibeTune Telegram Bot
 ═══════════════════════════════════════
-📡 Modal Endpoint: https://affum3331--vibetune-inference-inferenceservice-serve.modal.run
+📡 Modal Endpoint: your_endpoint
 🎯 Default Model: base (no finetuning)
 🌡️  Temperature: 0.7
 📝 Max Tokens: 250
