@@ -2,7 +2,7 @@
 """
 VibeTune Telegram Bot
 
-Full implementation of a Telegram bot that uses your Modal finetuned models.
+Simple Telegram bot that uses your Modal finetuned models.
 
 Setup:
 1. Get a Telegram bot token from @BotFather
@@ -10,10 +10,11 @@ Setup:
 3. Set TELEGRAM_BOT_TOKEN environment variable
 4. Run: python telegram_bot.py
 
-Usage:
-- Send any message to chat with your finetuned model
-- Use /model <modelId> to switch to a specific trained model
-- Use /base to use the base model
+The bot works out of the box with defaults. You can optionally set:
+- DEFAULT_SYSTEM_PROMPT (default: "delivery company")
+- DEFAULT_MODEL_ID (default: your trained model)
+- DEFAULT_TEMPERATURE (default: 0.8)
+- DEFAULT_MAX_TOKENS (default: 250)
 """
 
 import os
@@ -29,17 +30,18 @@ from telegram.ext import (
     filters,
 )
 
+# Required: Telegram bot token
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-MODAL_INFERENCE_URL = os.getenv(
-    "MODAL_INFERENCE_URL",
-    
-)
 
-DEFAULT_MODEL_ID = os.getenv("DEFAULT_MODEL_ID", None)
+# Modal inference endpoint
+MODAL_INFERENCE_URL = "https://adamssamuel9955--vibetune-inference-inferenceservice-serve.modal.run"
 
-DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.7"))
+# Defaults (work out of the box, can be overridden with environment variables)
+DEFAULT_MODEL_ID = "training-1764850841135-cmiqe0ncr0001t1rp8sjtt5yc"
+DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.8"))
 DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "250"))
-DEFAULT_TOP_P = float(os.getenv("DEFAULT_TOP_P", "0.9"))
+DEFAULT_TOP_P = float(os.getenv("DEFAULT_TOP_P", "0.95"))
+DEFAULT_SYSTEM_PROMPT = os.getenv("DEFAULT_SYSTEM_PROMPT", "delivery company")
 
 if not TELEGRAM_BOT_TOKEN:
     print("❌ ERROR: TELEGRAM_BOT_TOKEN environment variable is required")
@@ -64,9 +66,20 @@ def get_user_preferences(user_id: int) -> Dict[str, any]:
             "model_id": DEFAULT_MODEL_ID,
             "temperature": DEFAULT_TEMPERATURE,
             "max_tokens": DEFAULT_MAX_TOKENS,
+            "system_prompt": DEFAULT_SYSTEM_PROMPT,
         }
     return user_preferences[user_id]
 
+
+def build_prompt(system_prompt: str, user_message: str) -> str:
+    """
+    Build a prompt in the same format as the frontend.
+    Uses the chat template: <|im_start|>system, <|im_start|>user, <|im_start|>assistant
+    """
+    prompt = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+    prompt += f"<|im_start|>user\n{user_message}<|im_end|>\n"
+    prompt += "<|im_start|>assistant\n"
+    return prompt
 
 
 def call_modal_inference(
@@ -94,22 +107,26 @@ def call_modal_inference(
     # Only include modelId if it's not None (base model)
     if model_id:
         payload["modelId"] = model_id
+        logger.info(f"✅ [Modal] Using FINETUNED MODEL: {model_id}")
+    else:
+        logger.info("⚠️  [Modal] Using BASE MODEL (no finetuning)")
     
-    logger.info(f"[Modal] Calling inference endpoint: {inference_url}")
-    logger.info(f"[Modal] Model ID: {model_id or 'base'}")
-    logger.info(f"[Modal] Prompt: {prompt[:100]}...")
+    logger.info(f"📡 [Modal] Endpoint: {inference_url}")
+    logger.info(f"📦 [Modal] Payload keys: {list(payload.keys())}")
+    logger.info(f"🌡️  [Modal] Temperature: {temperature}, Max Tokens: {max_tokens}, Top P: {top_p}")
+    logger.info(f"📝 [Modal] Prompt preview: {prompt[:150]}...")
     
     try:
         response = requests.post(
             inference_url,
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=180,  
+            timeout=180,
         )
         
         if not response.ok:
             error_text = response.text
-            logger.error(f"[Modal] API error: {response.status_code} - {error_text}")
+            logger.error(f"❌ [Modal] API error: {response.status_code} - {error_text}")
             return {
                 "text": "",
                 "tokens": 0,
@@ -117,29 +134,39 @@ def call_modal_inference(
             }
         
         data = response.json()
-        logger.info(f"[Modal] Response received: {data.get('tokens', 0)} tokens")
+        tokens = data.get("tokens", 0)
+        text = data.get("text", "No response generated")
+        
+        logger.info(f"✅ [Modal] Response received: {tokens} tokens")
+        logger.info(f"📄 [Modal] Response preview: {text[:100]}...")
+        
+        # Verify model was used
+        if model_id:
+            logger.info(f"✅ [Modal] CONFIRMED: Finetuned model {model_id} was used")
+        else:
+            logger.info("⚠️  [Modal] CONFIRMED: Base model was used")
         
         return {
-            "text": data.get("text", "No response generated"),
-            "tokens": data.get("tokens", 0),
+            "text": text,
+            "tokens": tokens,
         }
         
     except requests.exceptions.Timeout:
-        logger.error("[Modal] Request timeout")
+        logger.error("❌ [Modal] Request timeout")
         return {
             "text": "",
             "tokens": 0,
             "error": "Request timeout - Modal endpoint took too long to respond",
         }
     except requests.exceptions.RequestException as e:
-        logger.error(f"[Modal] Request error: {e}")
+        logger.error(f"❌ [Modal] Request error: {e}")
         return {
             "text": "",
             "tokens": 0,
             "error": f"Failed to connect to Modal: {str(e)}",
         }
     except Exception as e:
-        logger.error(f"[Modal] Unexpected error: {e}")
+        logger.error(f"❌ [Modal] Unexpected error: {e}")
         return {
             "text": "",
             "tokens": 0,
@@ -161,18 +188,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     welcome_message = f"""
 🤖 Welcome to VibeTune Bot!
 
-I'm powered by models finetuned by developers at Gigsama. Just send me a message and I'll respond using your trained model!
+I'm powered by your finetuned Modal model. Just send me a message!
 
+Current Model: {current_model}
 
- Commands:
-/help - Show all commands
-/model <modelId> - Switch to a specific trained model
-  Example: /model training-12345
-/base - Use the base model (no finetuning)
+Commands:
 /status - Show current settings
-/settings - Configure generation parameters
-
-💡 Tip: You can use any trained model ID from your Modal training jobs.
+/model <modelId> - Switch to a different model
+/base - Use the base model
+/help - Show all commands
     """
     
     await update.message.reply_text(welcome_message.strip())
@@ -185,17 +209,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 /model <modelId> - Switch to a trained model
   Example: /model training-12345
-  Example: /model qwen-finetuned-67890
 
 /base - Switch back to the base model
 
 /status - Show current model and settings
 
-/settings - Configure temperature, max tokens, etc.
-
 /help - Show this help message
 
-💬 Just send a regular message to chat with your model!
+💬 Just send a regular message to chat!
     """
     await update.message.reply_text(help_message.strip())
 
@@ -207,8 +228,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not context.args or len(context.args) == 0:
         await update.message.reply_text(
             "❌ Please provide a model ID\n\n"
-            "Example: /model training-12345\n"
-            "Example: /model qwen-finetuned-67890"
+            "Example: /model training-12345"
         )
         return
     
@@ -225,6 +245,8 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     prefs["model_id"] = model_id
     user_preferences[user_id] = prefs
     
+    logger.info(f"🔄 [Telegram] User {user_id} switched to model: {model_id}")
+    
     await update.message.reply_text(
         f"✅ Switched to model: `{model_id}`\n\n"
         "Now send me a message to test it!",
@@ -239,6 +261,8 @@ async def base_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     prefs = get_user_preferences(user_id)
     prefs["model_id"] = None
     user_preferences[user_id] = prefs
+    
+    logger.info(f"🔄 [Telegram] User {user_id} switched to base model")
     
     await update.message.reply_text(
         "✅ Switched to base model\n\n" "Now send me a message to test it!"
@@ -258,41 +282,12 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 🌡️ Temperature: {prefs['temperature']}
 📝 Max Tokens: {prefs['max_tokens']}
 🎯 Top P: {DEFAULT_TOP_P}
+📋 System Prompt: {prefs['system_prompt'][:50]}...
 
 🔗 Modal Endpoint: {MODAL_INFERENCE_URL}
-
-💡 Use /model <modelId> to switch models
-💡 Use /settings to change parameters
     """
     
     await update.message.reply_text(status_message.strip())
-
-
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /settings command."""
-    settings_message = f"""
-⚙️ Settings Configuration:
-
-To change settings, use environment variables when starting the bot:
-
-• DEFAULT_TEMPERATURE - Creativity (0.0-2.0, default: 0.7)
-• DEFAULT_MAX_TOKENS - Response length (default: 250)
-• DEFAULT_TOP_P - Sampling parameter (0.0-1.0, default: 0.9)
-• DEFAULT_MODEL_ID - Default model to use
-
-Example:
-export DEFAULT_TEMPERATURE=0.8
-export DEFAULT_MAX_TOKENS=500
-export DEFAULT_MODEL_ID=training-12345
-python telegram_bot.py
-
-Current defaults:
-• Temperature: {DEFAULT_TEMPERATURE}
-• Max Tokens: {DEFAULT_MAX_TOKENS}
-• Top P: {DEFAULT_TOP_P}
-• Default Model: {DEFAULT_MODEL_ID or 'base'}
-    """
-    await update.message.reply_text(settings_message.strip())
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -311,13 +306,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         prefs = get_user_preferences(user_id)
         model_id = prefs["model_id"]
+        system_prompt = prefs.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
         
-        logger.info(f"[Telegram] Message from user {user_id}")
-        logger.info(f"[Telegram] Using model: {model_id or 'base'}")
-        logger.info(f"[Telegram] Prompt: {text[:100]}...")
+        logger.info("=" * 60)
+        logger.info(f"📨 [Telegram] New message from user {user_id}")
+        logger.info(f"💬 [Telegram] Message: {text[:100]}...")
+        logger.info(f"🤖 [Telegram] Model ID: {model_id or 'BASE MODEL'}")
+        logger.info(f"📋 [Telegram] System Prompt: {system_prompt[:50]}...")
+        
+        # Build formatted prompt (same format as frontend)
+        formatted_prompt = build_prompt(system_prompt, text)
+        
+        logger.info(f"📝 [Telegram] Formatted prompt length: {len(formatted_prompt)} chars")
         
         result = call_modal_inference(
-            text,
+            formatted_prompt,
             model_id,
             prefs["temperature"],
             prefs["max_tokens"],
@@ -325,7 +328,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         
         if result.get("error"):
-            logger.error(f"[Telegram] Error: {result['error']}")
+            logger.error(f"❌ [Telegram] Error: {result['error']}")
             await update.message.reply_text(
                 f"❌ Sorry, I encountered an error:\n\n"
                 f"`{result['error']}`\n\n"
@@ -340,16 +343,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return
         
-        logger.info(f"[Telegram] Response: {result['text'][:100]}...")
-        logger.info(f"[Telegram] Tokens: {result.get('tokens', 0)}")
+        response_text = result["text"]
+        tokens = result.get("tokens", 0)
         
-        await update.message.reply_text(result["text"])
+        logger.info(f"✅ [Telegram] Response generated: {tokens} tokens")
+        logger.info(f"📄 [Telegram] Response: {response_text[:100]}...")
+        logger.info("=" * 60)
         
-        if result.get("tokens", 0) > 0:
-            logger.info(f"[Telegram] ✅ Sent response ({result['tokens']} tokens)")
+        await update.message.reply_text(response_text)
             
     except Exception as e:
-        logger.error(f"[Telegram] Unexpected error: {e}", exc_info=True)
+        logger.error(f"❌ [Telegram] Unexpected error: {e}", exc_info=True)
         await update.message.reply_text(
             f"❌ An unexpected error occurred:\n\n"
             f"`{str(e)}`\n\n"
@@ -363,14 +367,15 @@ def main() -> None:
     print("🤖 VibeTune Telegram Bot")
     print("═══════════════════════════════════════")
     print(f"📡 Modal Endpoint: {MODAL_INFERENCE_URL}")
-    if DEFAULT_MODEL_ID:
-        print(f"🎯 Default Model: {DEFAULT_MODEL_ID}")
-    else:
-        print(f"🎯 Default Model: base (no finetuning)")
+    print(f"🎯 Default Model: {DEFAULT_MODEL_ID}")
+    print(f"📋 System Prompt: {DEFAULT_SYSTEM_PROMPT}")
     print(f"🌡️  Temperature: {DEFAULT_TEMPERATURE}")
     print(f"📝 Max Tokens: {DEFAULT_MAX_TOKENS}")
     print(f"🎯 Top P: {DEFAULT_TOP_P}")
     print("═══════════════════════════════════════")
+    print("✅ Bot is ready to receive messages!")
+    print("💡 Send /start to your bot to begin")
+    print()
     
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
@@ -379,19 +384,13 @@ def main() -> None:
     application.add_handler(CommandHandler("model", model_command))
     application.add_handler(CommandHandler("base", base_command))
     application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(CommandHandler("settings", settings_command))
     
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
-    
-    print("✅ Bot is ready to receive messages!")
-    print("💡 Send /start to your bot to begin")
-    print()
     
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
     main()
-
