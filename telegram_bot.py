@@ -31,7 +31,7 @@ from telegram.ext import (
 )
 
 # Required: Telegram bot token
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8332478522:AAEpwTXfBFlirazWtz93pPAqiHYqb8pf4eo")
 
 # Modal inference endpoint
 MODAL_INFERENCE_URL = "https://adamssamuel9955--vibetune-inference-inferenceservice-serve.modal.run"
@@ -58,6 +58,14 @@ logger = logging.getLogger(__name__)
 # Store user preferences (in production, use a database)
 user_preferences: Dict[int, Dict[str, any]] = {}
 
+# Store conversation history per user (in production, use a database)
+# Format: {user_id: [{"role": "user"|"assistant", "content": "..."}, ...]}
+user_conversations: Dict[int, list] = {}
+
+# Web app API URL for reports (optional, set via APP_URL env var)
+# export APP_URL=
+APP_URL = os.getenv("APP_URL", "http://localhost:3000")
+
 
 def get_user_preferences(user_id: int) -> Dict[str, any]:
     """Get user preferences or return defaults."""
@@ -69,6 +77,28 @@ def get_user_preferences(user_id: int) -> Dict[str, any]:
             "system_prompt": DEFAULT_SYSTEM_PROMPT,
         }
     return user_preferences[user_id]
+
+
+def get_user_conversation(user_id: int) -> list:
+    """Get user's conversation history."""
+    if user_id not in user_conversations:
+        user_conversations[user_id] = []
+    return user_conversations[user_id]
+
+
+def clear_user_conversation(user_id: int) -> None:
+    """Clear user's conversation history."""
+    user_conversations[user_id] = []
+    logger.info(f"🗑️  [Telegram] Cleared conversation history for user {user_id}")
+
+
+def add_to_conversation(user_id: int, role: str, content: str) -> None:
+    """Add a message to user's conversation history."""
+    conversation = get_user_conversation(user_id)
+    conversation.append({"role": role, "content": content})
+    # Keep only last 20 messages to avoid memory issues
+    if len(conversation) > 20:
+        conversation.pop(0)
 
 
 def build_prompt(system_prompt: str, user_message: str) -> str:
@@ -196,6 +226,8 @@ Commands:
 /status - Show current settings
 /model <modelId> - Switch to a different model
 /base - Use the base model
+/report <description> - Report a problem
+/clear - Clear chat history
 /help - Show all commands
     """
     
@@ -213,6 +245,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 /base - Switch back to the base model
 
 /status - Show current model and settings
+
+/report <description> - Report a problem
+  Example: /report The bot is not responding correctly
+
+/clear - Clear chat history and start fresh
 
 /help - Show this help message
 
@@ -274,6 +311,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
     prefs = get_user_preferences(user_id)
     current_model = format_model_id(prefs["model_id"])
+    conversation = get_user_conversation(user_id)
     
     status_message = f"""
 📊 Current Settings:
@@ -283,11 +321,130 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 📝 Max Tokens: {prefs['max_tokens']}
 🎯 Top P: {DEFAULT_TOP_P}
 📋 System Prompt: {prefs['system_prompt'][:50]}...
+💬 Messages in conversation: {len(conversation)}
 
 🔗 Modal Endpoint: {MODAL_INFERENCE_URL}
     """
     
     await update.message.reply_text(status_message.strip())
+
+
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /report command - Report a problem."""
+    user_id = update.effective_user.id
+    username = update.effective_user.username
+    
+    # Get report text from command arguments
+    if not context.args or len(context.args) == 0:
+        await update.message.reply_text(
+            "📝 Please describe the problem after /report\n\n"
+            "Example: /report The bot is giving incorrect responses\n\n"
+            "Or use: /report and then send your report in the next message"
+        )
+        return
+    
+    report_text = " ".join(context.args).strip()
+    
+    if not report_text:
+        await update.message.reply_text(
+            "❌ Report text cannot be empty. Please describe the problem."
+        )
+        return
+    
+    # Get conversation history for context
+    conversation = get_user_conversation(user_id)
+    
+    # Log conversation history details for debugging
+    logger.info(f"📋 [Report] Conversation history for user {user_id}:")
+    logger.info(f"   - History length: {len(conversation)} messages")
+    if conversation:
+        logger.info(f"   - First message: {conversation[0] if conversation else 'N/A'}")
+        logger.info(f"   - Last message: {conversation[-1] if conversation else 'N/A'}")
+        logger.info(f"   - Full history: {conversation}")
+    else:
+        logger.warning(f"   ⚠️  No conversation history found for user {user_id}")
+        logger.warning(f"   - This might be because:")
+        logger.warning(f"     * User sent /report without any prior messages")
+        logger.warning(f"     * User cleared conversation with /clear")
+        logger.warning(f"     * Bot was restarted (conversation history is in-memory)")
+    
+    # Get bot username
+    bot_info = await context.bot.get_me()
+    bot_username = bot_info.username if bot_info else None
+    logger.info(f"🤖 [Report] Bot username: {bot_username}")
+    
+    # Send report to API
+    if APP_URL:
+        try:
+            reports_url = f"{APP_URL}/api/reports"
+            payload = {
+                "telegramUserId": user_id,
+                "username": username,
+                "botUsername": bot_username,
+                "reportText": report_text,
+                "conversationHistory": conversation if conversation else None,
+            }
+            
+            logger.info(f"📤 [Report] Sending report from user {user_id} to {reports_url}")
+            logger.info(f"📦 [Report] Payload conversationHistory: {payload['conversationHistory']}")
+            
+            response = requests.post(
+                reports_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            
+            if response.ok:
+                logger.info(f"✅ [Report] Report successfully saved for user {user_id}")
+                await update.message.reply_text(
+                    "✅ Thank you for your report! It has been saved and will be reviewed.\n\n"
+                    "🔄 Starting a fresh conversation..."
+                )
+                # Clear conversation history after reporting
+                clear_user_conversation(user_id)
+            else:
+                logger.error(f"❌ [Report] Failed to save report: {response.status_code} - {response.text}")
+                await update.message.reply_text(
+                    "⚠️ Your report was received, but there was an issue saving it.\n\n"
+                    "The report text has been logged. Please try again if the problem persists."
+                )
+                # Still clear conversation to start fresh
+                clear_user_conversation(user_id)
+        except Exception as e:
+            logger.error(f"❌ [Report] Error sending report: {e}", exc_info=True)
+            await update.message.reply_text(
+                "⚠️ There was an error sending your report, but it has been logged locally.\n\n"
+                "🔄 Starting a fresh conversation..."
+            )
+            # Still clear conversation to start fresh
+            clear_user_conversation(user_id)
+    else:
+        # No APP_URL configured, just log locally
+        bot_info = await context.bot.get_me()
+        bot_username = bot_info.username if bot_info else "unknown"
+        logger.warning(f"📝 [Report] Report from user {user_id} (@{username}) to bot @{bot_username}: {report_text}")
+        logger.warning(f"📝 [Report] Conversation history: {conversation}")
+        await update.message.reply_text(
+            "✅ Your report has been logged. Thank you!\n\n"
+            "🔄 Starting a fresh conversation..."
+        )
+        # Clear conversation history after reporting
+        clear_user_conversation(user_id)
+
+
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /clear command - Clear chat history."""
+    user_id = update.effective_user.id
+    
+    clear_user_conversation(user_id)
+    
+    logger.info(f"🗑️  [Telegram] User {user_id} cleared their conversation")
+    
+    await update.message.reply_text(
+        "✅ Chat history cleared!\n\n"
+        "You're starting with a fresh conversation. Send me a message to begin!"
+    )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -307,6 +464,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         prefs = get_user_preferences(user_id)
         model_id = prefs["model_id"]
         system_prompt = prefs.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
+        
+        # Add user message to conversation history
+        add_to_conversation(user_id, "user", text)
+        current_conv = get_user_conversation(user_id)
+        logger.debug(f"💬 [Conversation] Added user message. Total messages: {len(current_conv)}")
         
         logger.info("=" * 60)
         logger.info(f"📨 [Telegram] New message from user {user_id}")
@@ -346,6 +508,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         response_text = result["text"]
         tokens = result.get("tokens", 0)
         
+        # Add assistant response to conversation history
+        add_to_conversation(user_id, "assistant", response_text)
+        logger.debug(f"🤖 [Conversation] Added assistant message. Total messages: {len(get_user_conversation(user_id))}")
+        
         logger.info(f"✅ [Telegram] Response generated: {tokens} tokens")
         logger.info(f"📄 [Telegram] Response: {response_text[:100]}...")
         logger.info("=" * 60)
@@ -384,6 +550,8 @@ def main() -> None:
     application.add_handler(CommandHandler("model", model_command))
     application.add_handler(CommandHandler("base", base_command))
     application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("report", report_command))
+    application.add_handler(CommandHandler("clear", clear_command))
     
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
