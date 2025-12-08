@@ -31,7 +31,7 @@ from telegram.ext import (
 )
 
 # Required: Telegram bot token
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8332478522:AAEpwTXfBFlirazWtz93pPAqiHYqb8pf4eo")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 # Modal inference endpoint
 MODAL_INFERENCE_URL = "https://adamssamuel9955--vibetune-inference-inferenceservice-serve.modal.run"
