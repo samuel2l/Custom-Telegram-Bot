@@ -90,9 +90,9 @@ bot_info_cache: Dict[str, Dict[str, Any]] = {}
 bot_manager_instance: Optional['BotManager'] = None
 
 # Webhook server port (configurable via env var)
-# In production: Set BOT_WEBHOOK_PORT to the port your bot server exposes
+# Railway uses PORT env var, otherwise fall back to BOT_WEBHOOK_PORT or default 8888
 # The frontend uses BOT_SERVER_URL env var to reach this endpoint
-WEBHOOK_PORT = int(os.getenv("BOT_WEBHOOK_PORT", "8888"))
+WEBHOOK_PORT = int(os.getenv("PORT") or os.getenv("BOT_WEBHOOK_PORT", "8888"))
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
