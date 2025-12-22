@@ -27,9 +27,6 @@ import os
 import logging
 import requests
 import urllib3
-
-# Disable SSL warnings for self-signed certificates
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import json
 import re
 import psycopg2
@@ -54,24 +51,37 @@ from threading import Thread
 import sys
 TELEGRAM_BOT_TOKEN = ""
 
-# Database connection
-DATABASE_URL = os.getenv("DATABASE_URL", "postgres://admin:CLMTcdBXhSQpgUeN@db.lazycore.io:32822/chat?sslmode=require")
+# Database connection (REQUIRED)
+DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     print("❌ ERROR: DATABASE_URL environment variable is required")
     exit(1)
 
-# Modal inference endpoint
-MODAL_INFERENCE_URL = "https://akyeremeh43--vibetune-inference-vllm-vllminference-serve.modal.run"
+# Modal inference endpoint (REQUIRED)
+MODAL_INFERENCE_URL = os.getenv("MODAL_INFERENCE_URL")
+if not MODAL_INFERENCE_URL:
+    print("❌ ERROR: MODAL_INFERENCE_URL environment variable is required")
+    exit(1)
 
 # Defaults (work out of the box, can be overridden with environment variables)
-DEFAULT_MODEL_ID = "qwen-finetuned-1765829382667"
+DEFAULT_MODEL_ID = os.getenv("DEFAULT_MODEL_ID", "")
 DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.8"))
 DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "1024"))
 DEFAULT_TOP_P = float(os.getenv("DEFAULT_TOP_P", "0.95"))
-DEFAULT_SYSTEM_PROMPT = os.getenv("DEFAULT_SYSTEM_PROMPT", "delivery company")
+DEFAULT_SYSTEM_PROMPT = os.getenv("DEFAULT_SYSTEM_PROMPT", "You are a helpful assistant.")
 
-# Web app API URL for reports (optional, set via APP_URL env var)
-APP_URL = os.getenv("APP_URL", "http://localhost:3000")
+# Web app API URL for reports and bot lookup (REQUIRED)
+APP_URL = os.getenv("APP_URL")
+if not APP_URL:
+    print("❌ ERROR: APP_URL environment variable is required")
+    exit(1)
+
+# SSL verification (default: True for production, can disable for self-signed certs)
+SSL_VERIFY = os.getenv("SSL_VERIFY", "true").lower() == "true"
+
+# Disable SSL warnings only if SSL verification is disabled
+if not SSL_VERIFY:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Store bot info cache per token
 bot_info_cache: Dict[str, Dict[str, Any]] = {}
@@ -81,8 +91,7 @@ bot_manager_instance: Optional['BotManager'] = None
 
 # Webhook server port (configurable via env var)
 # In production: Set BOT_WEBHOOK_PORT to the port your bot server exposes
-# The frontend uses BOT_SERVER_URL env var (defaults to http://localhost:8888)
-# Make sure the bot server URL is accessible from your Next.js app
+# The frontend uses BOT_SERVER_URL env var to reach this endpoint
 WEBHOOK_PORT = int(os.getenv("BOT_WEBHOOK_PORT", "8888"))
 
 logging.basicConfig(
@@ -192,7 +201,7 @@ def lookup_bot_by_token(token: str) -> Optional[Dict[str, Any]]:
             json={"token": token},
             headers={"Content-Type": "application/json"},
             timeout=10,
-            verify=False,  # Disable SSL verification for self-signed certificates
+            verify=SSL_VERIFY,
         )
         
         logger.info(f"📡 Response status: {response.status_code}")
@@ -1377,7 +1386,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 json=payload,
                 headers={"Content-Type": "application/json"},
                 timeout=10,
-                verify=False,  # Disable SSL verification for self-signed certificates
+                verify=SSL_VERIFY,
             )
             
             if response.ok:
@@ -2178,7 +2187,7 @@ def start_webhook_server_thread(bot_manager: 'BotManager') -> Thread:
     def run_server():
         server = HTTPServer(('0.0.0.0', WEBHOOK_PORT), WebhookHandler)
         logger.info(f"🌐 Webhook server started on port {WEBHOOK_PORT}")
-        logger.info(f"   POST http://localhost:{WEBHOOK_PORT}/sync - Trigger bot sync")
+        logger.info(f"   POST http://0.0.0.0:{WEBHOOK_PORT}/sync - Trigger bot sync")
         server.serve_forever()
     
     thread = Thread(target=run_server, daemon=True)
@@ -2255,7 +2264,7 @@ async def main_async() -> None:
         
         print("🔄 Dynamic bot discovery enabled")
         print("💡 New bots created in the frontend will be automatically picked up via webhook!")
-        print(f"🌐 Webhook endpoint: http://localhost:{WEBHOOK_PORT}/sync")
+        print(f"🌐 Webhook endpoint: http://0.0.0.0:{WEBHOOK_PORT}/sync")
         print("💡 Send /start to any bot to begin")
         print("")
         
