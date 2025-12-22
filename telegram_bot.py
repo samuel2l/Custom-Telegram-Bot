@@ -29,6 +29,7 @@ import requests
 import urllib3
 import json
 import re
+import time
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from typing import Optional, Dict, List, Any
@@ -88,6 +89,24 @@ bot_info_cache: Dict[str, Dict[str, Any]] = {}
 
 # Global bot manager instance (set in main_async)
 bot_manager_instance: Optional['BotManager'] = None
+
+# Global requests session for connection pooling (reduces latency)
+_http_session: Optional[requests.Session] = None
+
+def get_http_session() -> requests.Session:
+    """Get or create a global HTTP session for connection pooling."""
+    global _http_session
+    if _http_session is None:
+        _http_session = requests.Session()
+        # Configure connection pooling
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=20,
+            max_retries=0,  # We handle retries ourselves if needed
+        )
+        _http_session.mount('http://', adapter)
+        _http_session.mount('https://', adapter)
+    return _http_session
 
 # Webhook server port (configurable via env var)
 # Railway uses PORT env var, otherwise fall back to BOT_WEBHOOK_PORT or default 8888
@@ -196,11 +215,12 @@ def lookup_bot_by_token(token: str) -> Optional[Dict[str, Any]]:
     try:
         lookup_url = f"{APP_URL}/api/bots/lookup"
         logger.info(f"🔍 Looking up bot at: {lookup_url}")
-        response = requests.post(
+        session = get_http_session()
+        response = session.post(
             lookup_url,
             json={"token": token},
             headers={"Content-Type": "application/json"},
-            timeout=10,
+            timeout=(5, 10),  # (connect timeout, read timeout)
             verify=SSL_VERIFY,
         )
         
@@ -883,19 +903,20 @@ def execute_tool_call(tool_call: Dict[str, Any], tools: List[Dict[str, Any]], te
         logger.info(f"📤 [execute_tool_call] Final params for API call: {json.dumps(params, indent=2)}")
         
         # Make the API call
+        session = get_http_session()
         if method == "GET":
             url_params = "&".join([f"{k}={requests.utils.quote(str(v))}" for k, v in params.items()])
             url = f"{tool['endpoint']}?{url_params}" if url_params else tool["endpoint"]
             logger.info(f"🌐 [execute_tool_call] Making GET request to: {url}")
-            response = requests.get(url, timeout=30)
+            response = session.get(url, timeout=(5, 30))  # (connect timeout, read timeout)
         else:
             logger.info(f"🌐 [execute_tool_call] Making POST request to: {tool['endpoint']}")
             logger.info(f"📦 [execute_tool_call] Request body: {json.dumps(params, indent=2)}")
-            response = requests.post(
+            response = session.post(
                 tool["endpoint"],
                 json=params,
                 headers={"Content-Type": "application/json"},
-                timeout=30
+                timeout=(5, 30)  # (connect timeout, read timeout)
             )
         
         logger.info(f"📡 [execute_tool_call] Response status: {response.status_code} {response.reason}")
@@ -1015,6 +1036,8 @@ def call_modal_inference(
     Returns:
         dict with 'text', 'tokens', and optionally 'error'
     """
+    import time
+    
     inference_url = f"{MODAL_INFERENCE_URL}/inference"
     
     payload = {
@@ -1035,13 +1058,24 @@ def call_modal_inference(
     logger.info(f"📝 [Modal] Prompt preview: {prompt[:150]}...")
     logger.info(f"📦 [Modal] Request payload: {json.dumps({**payload, 'prompt': prompt[:200] + '...' if len(prompt) > 200 else prompt}, indent=2)}")
     
+    # Get session for connection pooling
+    session = get_http_session()
+    
     try:
-        response = requests.post(
+        # Time the request
+        request_start = time.time()
+        logger.info(f"⏱️  [Modal] Starting request at {datetime.now().isoformat()}")
+        
+        response = session.post(
             inference_url,
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=180,
+            timeout=(10, 60),  # (connect timeout, read timeout) - 10s to connect, 60s to read
         )
+        
+        request_end = time.time()
+        request_duration = request_end - request_start
+        logger.info(f"⏱️  [Modal] Request completed in {request_duration:.2f}s (connect + read time)")
         
         logger.info(f"📡 [Modal] Response status: {response.status_code}")
         logger.info(f"📡 [Modal] Response headers: {dict(response.headers)}")
@@ -1381,11 +1415,12 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             
             logger.info(f"📤 [Report] Sending report from user {user_id} (@{username}) via bot @{bot_username} to {reports_url}")
             
-            response = requests.post(
+            session = get_http_session()
+            response = session.post(
                 reports_url,
                 json=payload,
                 headers={"Content-Type": "application/json"},
-                timeout=10,
+                timeout=(5, 10),  # (connect timeout, read timeout)
                 verify=SSL_VERIFY,
             )
             
