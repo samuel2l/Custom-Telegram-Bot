@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
 """
-VibeTune Telegram Bot
+VibeTune Telegram Bot - Multi-Bot Server
 
-Telegram bot that uses your Modal finetuned models and integrates with the database.
+Telegram bot server that can handle multiple bots simultaneously. Each bot uses its own
+token and project configuration.
 
 Setup:
-1. Get a Telegram bot token from @BotFather
+1. Create bots in the frontend (Settings → Bots tab) and get tokens from BotFather
 2. Install dependencies: pip install -r requirements.txt
-3. Set TELEGRAM_BOT_TOKEN and DATABASE_URL environment variables
+3. Set DATABASE_URL environment variable (or it will use the default)
 4. Run: python telegram_bot.py
+   - The server will automatically fetch all active bots from the database
+   - Each bot will use its associated project configuration (models, tools, etc.)
 
-The bot:
-- Fetches tools from database and includes them in system prompt
-- Saves all messages to database in correct order
+The bot server:
+- Automatically discovers all active bots from the database
+- Each bot uses its own token and project configuration
+- Fetches tools from database per project and includes them in system prompt
+- Saves all messages to database in correct order with source="bot"
 - Handles tool calls properly (user message, tool_call, tool_response, natural language response)
+- Exposes HTTP webhook endpoint (/sync) for immediate bot discovery when bots are created/updated
+- Relies solely on webhook updates from the frontend (no polling)
 """
 
 import os
 import logging
 import requests
+import urllib3
 import json
 import re
 import psycopg2
@@ -34,34 +42,57 @@ from telegram.ext import (
 )
 from datetime import datetime
 import uuid
+import asyncio
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from threading import Thread
 
-# Required: Telegram bot token
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8332478522:AAEpwTXfBFlirazWtz93pPAqiHYqb8pf4eo")
+# Optional: Single bot token for backward compatibility
+# If provided, only that bot will run. Otherwise, all active bots are loaded.
+import sys
+TELEGRAM_BOT_TOKEN = ""
 
-# Database connection
-DATABASE_URL = "postgres://admin:CLMTcdBXhSQpgUeN@db.lazycore.io:32822/chat?sslmode=require"
+# Database connection (REQUIRED)
+DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     print("❌ ERROR: DATABASE_URL environment variable is required")
     exit(1)
 
-# Modal inference endpoint
-MODAL_INFERENCE_URL = "https://samuelkyeremeh224--vibetune-inference-vllm-vllminference-serve.modal.run"
+# Modal inference endpoint (REQUIRED)
+MODAL_INFERENCE_URL = os.getenv("MODAL_INFERENCE_URL")
+if not MODAL_INFERENCE_URL:
+    print("❌ ERROR: MODAL_INFERENCE_URL environment variable is required")
+    exit(1)
 
 # Defaults (work out of the box, can be overridden with environment variables)
-DEFAULT_MODEL_ID = "qwen-finetuned-1765829382667"
+DEFAULT_MODEL_ID = os.getenv("DEFAULT_MODEL_ID", "")
 DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.8"))
 DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "1024"))
 DEFAULT_TOP_P = float(os.getenv("DEFAULT_TOP_P", "0.95"))
-DEFAULT_SYSTEM_PROMPT = os.getenv("DEFAULT_SYSTEM_PROMPT", "delivery company")
+DEFAULT_SYSTEM_PROMPT = os.getenv("DEFAULT_SYSTEM_PROMPT", "You are a helpful assistant.")
 
-# Web app API URL for reports (optional, set via APP_URL env var)
-APP_URL = os.getenv("APP_URL", "https://chat.lazycore.io")
-
-if not TELEGRAM_BOT_TOKEN:
-    print("❌ ERROR: TELEGRAM_BOT_TOKEN environment variable is required")
-    print("   Get a token from @BotFather on Telegram")
-    print("   Then run: export TELEGRAM_BOT_TOKEN=your_token_here")
+# Web app API URL for reports and bot lookup (REQUIRED)
+APP_URL = os.getenv("APP_URL")
+if not APP_URL:
+    print("❌ ERROR: APP_URL environment variable is required")
     exit(1)
+
+# SSL verification (default: True for production, can disable for self-signed certs)
+SSL_VERIFY = os.getenv("SSL_VERIFY", "true").lower() == "true"
+
+# Disable SSL warnings only if SSL verification is disabled
+if not SSL_VERIFY:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Store bot info cache per token
+bot_info_cache: Dict[str, Dict[str, Any]] = {}
+
+# Global bot manager instance (set in main_async)
+bot_manager_instance: Optional['BotManager'] = None
+
+# Webhook server port (configurable via env var)
+# In production: Set BOT_WEBHOOK_PORT to the port your bot server exposes
+# The frontend uses BOT_SERVER_URL env var to reach this endpoint
+WEBHOOK_PORT = int(os.getenv("BOT_WEBHOOK_PORT", "8888"))
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -145,113 +176,214 @@ def get_project_system_prompt(project_id: str) -> Optional[str]:
         conn.close()
 
 
-def get_or_create_telegram_project(bot_username: str) -> str:
+def lookup_bot_by_token(token: str) -> Optional[Dict[str, Any]]:
     """
-    Get or create a project for a specific Telegram bot.
-    Project name will be the bot's username.
+    Look up bot information by token from the API.
+    This replaces the old get_or_create_telegram_project function.
     
     Args:
-        bot_username: The Telegram bot's username (e.g., "my_bot")
+        token: The Telegram bot token
     
     Returns:
-        Project ID
+        Bot info dict with project info, or None if not found
     """
-    if not bot_username:
-        raise ValueError("bot_username is required")
+    global bot_info_cache
     
+    # Use cached info if available
+    if token in bot_info_cache:
+        return bot_info_cache[token]
+    
+    try:
+        lookup_url = f"{APP_URL}/api/bots/lookup"
+        logger.info(f"🔍 Looking up bot at: {lookup_url}")
+        response = requests.post(
+            lookup_url,
+            json={"token": token},
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+            verify=SSL_VERIFY,
+        )
+        
+        logger.info(f"📡 Response status: {response.status_code}")
+        if not response.ok:
+            logger.error(f"❌ Failed to lookup bot: {response.status_code} - {response.text[:200]}")
+            logger.error(f"❌ Full response headers: {dict(response.headers)}")
+            return None
+        
+        data = response.json()
+        bot_data = data.get("bot")
+        
+        if not bot_data:
+            logger.error(f"❌ Bot not found in API response")
+            return None
+        
+        # Cache the bot info
+        bot_info = {
+            "token": token,
+            "botId": bot_data["id"],
+            "username": bot_data["username"],
+            "projectId": bot_data["projectId"],
+            "project": bot_data["project"],
+        }
+        bot_info_cache[token] = bot_info
+        
+        logger.info(f"✅ Found bot @{bot_data['username']} for project {bot_data['projectId']}")
+        return bot_info
+        
+    except Exception as e:
+        logger.error(f"❌ Error looking up bot by token: {e}")
+        return None
+
+
+def fetch_all_active_bots() -> List[Dict[str, Any]]:
+    """
+    Fetch all active bots from the database.
+    
+    Returns:
+        List of bot dicts with token, username, projectId, etc.
+    """
     conn = get_db_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Try to find existing project for this bot
             cur.execute(
                 """
-                SELECT id FROM "Project"
-                WHERE name = %s
-                LIMIT 1
-                """,
-                (bot_username,)
-            )
-            project = cur.fetchone()
-            
-            if project:
-                logger.info(f"✅ Found existing project for bot @{bot_username}: {project['id']}")
-                return project["id"]
-            
-            # Create new project - we need a userId, so we'll use the first user
-            # In production, you might want to create a dedicated bot user
-            cur.execute(
-                """
-                SELECT id FROM "User" LIMIT 1
+                SELECT id, name, username, token, "projectId", "isActive"
+                FROM "TelegramBot"
+                WHERE "isActive" = true
+                ORDER BY "createdAt" DESC
                 """
             )
-            user = cur.fetchone()
+            bots = cur.fetchall()
+            logger.info(f"📋 Found {len(bots)} active bot(s) in database")
+            return [dict(bot) for bot in bots]
+    except Exception as e:
+        logger.error(f"❌ Error fetching active bots: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def create_new_conversation(
+    telegram_user_id: int, 
+    bot_username: str, 
+    project_id: str, 
+    telegram_bot_id: str,
+    telegram_username: Optional[str] = None,
+    telegram_first_name: Optional[str] = None
+) -> str:
+    """
+    Create a new conversation for a Telegram user (always creates new, never reuses).
+    Used for /clear and /report commands to start fresh conversations.
+    
+    Args:
+        telegram_user_id: The Telegram user's numeric ID
+        bot_username: The bot's username
+        project_id: The project ID
+        telegram_bot_id: The TelegramBot record ID
+        telegram_username: The Telegram user's @username (optional)
+        telegram_first_name: The Telegram user's first name (optional)
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Always create a new conversation
+            conversation_id = str(uuid.uuid4())
             
-            if not user:
-                raise Exception("No users found in database. Please create a user first.")
-            
-            project_id = str(uuid.uuid4())
+            # Build a descriptive title with available user info
+            # Add timestamp to ensure uniqueness (required by DB constraint)
+            timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+            title_parts = [f"Telegram: {telegram_user_id}"]
+            if telegram_username:
+                title_parts.append(f"@{telegram_username}")
+            if telegram_first_name:
+                title_parts.append(telegram_first_name)
+            title_parts.append(f"(via @{bot_username})")
+            # Add timestamp to make title unique
+            base_title = " | ".join(title_parts[:3]) if len(title_parts) > 3 else " | ".join(title_parts)
+            title = f"{base_title} - {timestamp_str}"
             cur.execute(
                 """
-                INSERT INTO "Project" (id, name, description, "baseModel", "userId", "createdAt", "updatedAt")
+                INSERT INTO "Conversation" (id, title, "projectId", source, "telegramBotId", "createdAt", "updatedAt")
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
-                (
-                    project_id,
-                    bot_username,  # Use bot username as project name
-                    f"Conversations from Telegram bot @{bot_username}",
-                    "qwen-3.7b",
-                    user["id"],
-                    datetime.now(),
-                    datetime.now()
-                )
+                (conversation_id, title, project_id, "bot", telegram_bot_id, datetime.now(), datetime.now())
             )
             conn.commit()
-            logger.info(f"📝 Created new project for bot @{bot_username}: {project_id}")
-            return project_id
+            logger.info(f"📝 Created new bot conversation {conversation_id} for Telegram user {telegram_user_id}")
+            return conversation_id
     except Exception as e:
-        logger.error(f"❌ Error getting/creating Telegram project for @{bot_username}: {e}")
+        logger.error(f"❌ Error creating conversation: {e}")
         conn.rollback()
         raise
     finally:
         conn.close()
 
 
-def get_or_create_conversation(telegram_user_id: int, bot_username: str, project_id: str) -> str:
-    """Get or create a conversation for a Telegram user, stored in database."""
+def get_or_create_conversation(
+    telegram_user_id: int, 
+    bot_username: str, 
+    project_id: str, 
+    telegram_bot_id: str,
+    telegram_username: Optional[str] = None,
+    telegram_first_name: Optional[str] = None
+) -> str:
+    """
+    Get or create a conversation for a Telegram user, stored in database.
+    Now tags conversations with source="bot" and telegramBotId.
+    Reuses existing conversation if found, otherwise creates new.
+    
+    Args:
+        telegram_user_id: The Telegram user's numeric ID
+        bot_username: The bot's username
+        project_id: The project ID
+        telegram_bot_id: The TelegramBot record ID
+        telegram_username: The Telegram user's @username (optional)
+        telegram_first_name: The Telegram user's first name (optional)
+    """
     conn = get_db_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             # Try to find existing conversation for this user
-            # We'll use a special title format: "Telegram: @username" or "Telegram: user_id"
+            # We'll use a special title format: "Telegram: {userId} | @{username} | {firstName}"
             cur.execute(
                 """
                 SELECT id FROM "Conversation"
                 WHERE "projectId" = %s
+                AND "telegramBotId" = %s
                 AND title LIKE %s
                 ORDER BY "createdAt" DESC
                 LIMIT 1
                 """,
-                (project_id, f"Telegram: {telegram_user_id}%")
+                (project_id, telegram_bot_id, f"Telegram: {telegram_user_id}%")
             )
             conversation = cur.fetchone()
             
             if conversation:
                 return conversation["id"]
             
-            # Create a new conversation
+            # Create a new conversation with source="bot" and telegramBotId
+            # Include Telegram user info in title for display
             conversation_id = str(uuid.uuid4())
-            title = f"Telegram: {telegram_user_id} (@{bot_username})"
+            
+            # Build a descriptive title with available user info
+            title_parts = [f"Telegram: {telegram_user_id}"]
+            if telegram_username:
+                title_parts.append(f"@{telegram_username}")
+            if telegram_first_name:
+                title_parts.append(telegram_first_name)
+            title_parts.append(f"(via @{bot_username})")
+            title = " | ".join(title_parts[:3]) if len(title_parts) > 3 else " | ".join(title_parts)
             cur.execute(
                 """
-                INSERT INTO "Conversation" (id, title, "projectId", "createdAt", "updatedAt")
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO "Conversation" (id, title, "projectId", source, "telegramBotId", "createdAt", "updatedAt")
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
-                (conversation_id, title, project_id, datetime.now(), datetime.now())
+                (conversation_id, title, project_id, "bot", telegram_bot_id, datetime.now(), datetime.now())
             )
             conn.commit()
-            logger.info(f"📝 Created new conversation {conversation_id} for Telegram user {telegram_user_id}")
+            logger.info(f"📝 Created new bot conversation {conversation_id} for Telegram user {telegram_user_id}")
             return conversation_id
     except Exception as e:
         logger.error(f"❌ Error creating conversation: {e}")
@@ -441,12 +573,60 @@ When a user provides natural language that needs to be structured as nested JSON
 """
 
 
-def build_prompt(system_prompt: str, user_message: str) -> str:
+def fetch_conversation_history(conversation_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    Fetch the last N messages from a conversation, excluding tool calls and tool responses.
+    Returns a list of messages with 'role' and 'content' fields.
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT role, content
+                FROM "Message"
+                WHERE "conversationId" = %s
+                  AND "isToolCall" = false
+                  AND "isToolResponse" = false
+                ORDER BY "createdAt" DESC
+                LIMIT %s
+                """,
+                (conversation_id, limit)
+            )
+            rows = cur.fetchall()
+            # Reverse to get chronological order (oldest first)
+            messages = [{"role": row[0], "content": row[1]} for row in reversed(rows)]
+            logger.info(f"📚 Fetched {len(messages)} messages from conversation history (excluding tool calls/responses)")
+            return messages
+    except Exception as e:
+        logger.error(f"❌ Error fetching conversation history: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def build_prompt(system_prompt: str, user_message: str, conversation_history: Optional[List[Dict[str, Any]]] = None) -> str:
     """
     Build a prompt in the same format as the frontend.
     Uses the chat template: <|im_start|>system, <|im_start|>user, <|im_start|>assistant
+    
+    Args:
+        system_prompt: The system prompt
+        user_message: The current user message
+        conversation_history: Optional list of previous messages (excluding the current one)
+                             Each message should have 'role' ('user' or 'assistant') and 'content'
     """
     prompt = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+    
+    # Add conversation history if provided (excluding the current user message)
+    if conversation_history:
+        for msg in conversation_history:
+            role = msg.get("role", "").lower()
+            content = msg.get("content", "")
+            if role in ["user", "assistant"] and content:
+                prompt += f"<|im_start|>{role}\n{content}<|im_end|>\n"
+    
+    # Add current user message
     prompt += f"<|im_start|>user\n{user_message}<|im_end|>\n"
     prompt += "<|im_start|>assistant\n"
     return prompt
@@ -957,6 +1137,11 @@ def format_model_id(model_id: Optional[str]) -> str:
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command."""
+    bot_token = context.bot_data.get("bot_token")
+    if not bot_token:
+        await update.message.reply_text("❌ Bot configuration error. Please contact support.")
+        return
+    
     user_id = update.effective_user.id
     prefs = get_user_preferences(user_id)
     current_model = format_model_id(prefs["model_id"])
@@ -1053,33 +1238,49 @@ async def base_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /status command."""
+    bot_token = context.bot_data.get("bot_token")
+    if not bot_token:
+        await update.message.reply_text("❌ Bot configuration error. Please contact support.")
+        return
+    
     user_id = update.effective_user.id
     prefs = get_user_preferences(user_id)
     current_model = format_model_id(prefs["model_id"])
     
-    # Get bot username
-    bot_info = await context.bot.get_me()
-    bot_username = bot_info.username if bot_info else None
+    # Look up bot info
+    bot_data = lookup_bot_by_token(bot_token)
+    if not bot_data:
+        await update.message.reply_text(
+            "❌ Bot configuration not found. Please configure this bot in the frontend first."
+        )
+        return
     
-    # Find project by model_id
+    bot_username = bot_data["username"]
+    project_id = bot_data["projectId"]
+    project_data = bot_data["project"]
+    
+    # Find project by model_id (if user selected one)
     project = find_project_by_model_id(prefs["model_id"])
-    project_info = "None (using fallback)" if not project else f"{project['name']} ({project['id'][:8]}...)"
-    system_prompt_preview = "You are a helpful assistant."
+    project_info = f"{project_data['name']} ({project_id[:8]}...)" if project_data else "None"
+    system_prompt_preview = project_data.get("systemPrompt", "You are a helpful assistant.")[:50] + "..." if project_data.get("systemPrompt") else "You are a helpful assistant."
+    
     if project:
+        project_info = f"{project['name']} ({project['id'][:8]}...)"
         project_system_prompt = get_project_system_prompt(project["id"])
         if project_system_prompt:
             system_prompt_preview = project_system_prompt[:50] + "..."
         elif project.get("description"):
             system_prompt_preview = project["description"][:50] + "..."
     
-    # Get bot username if not already retrieved
-    if not bot_username:
-        bot_info = await context.bot.get_me()
-        bot_username = bot_info.username if bot_info else "unknown"
-    
     # Get conversation
-    telegram_project_id = get_or_create_telegram_project(bot_username)
-    conversation_id = get_or_create_conversation(user_id, bot_username, telegram_project_id)
+    bot_id = bot_data["botId"]
+    telegram_username = update.effective_user.username
+    telegram_first_name = update.effective_user.first_name
+    conversation_id = get_or_create_conversation(
+        user_id, bot_username, project_id, bot_id,
+        telegram_username=telegram_username,
+        telegram_first_name=telegram_first_name
+    )
     
     status_message = f"""
 📊 Current Settings:
@@ -1099,7 +1300,12 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /report command - Report a problem."""
+    """Handle /report command - Report a problem and create a new conversation."""
+    bot_token = context.bot_data.get("bot_token")
+    if not bot_token:
+        await update.message.reply_text("❌ Bot configuration error. Please contact support.")
+        return
+    
     user_id = update.effective_user.id
     username = update.effective_user.username
     
@@ -1118,65 +1324,127 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
     
+    # Look up bot info
+    bot_data = lookup_bot_by_token(bot_token)
+    if not bot_data:
+        await update.message.reply_text(
+            "❌ Bot configuration not found. Please configure this bot in the frontend first."
+        )
+        return
+    
+    bot_id = bot_data["botId"]
+    bot_username = bot_data["username"]
+    project_id = bot_data["projectId"]
+    
+    telegram_username = update.effective_user.username
+    telegram_first_name = update.effective_user.first_name
+    
+    # Get conversation history BEFORE creating new conversation (from the existing conversation)
+    conversation_history = None
+    try:
+        # Get the existing conversation to fetch its history
+        existing_conversation_id = get_or_create_conversation(
+            user_id, bot_username, project_id, bot_id,
+            telegram_username=telegram_username,
+            telegram_first_name=telegram_first_name
+        )
+        # Fetch last 10 messages from existing conversation
+        history_messages = fetch_conversation_history(existing_conversation_id, limit=10)
+        if history_messages:
+            conversation_history = history_messages
+            logger.info(f"📚 [Report] Including {len(history_messages)} messages in report context")
+    except Exception as hist_error:
+        logger.warning(f"⚠️ [Report] Could not fetch conversation history: {hist_error}")
+    
+    # Create a NEW conversation after report (old one stays in DB)
+    # This ensures the frontend shows separate conversations before/after report
+    conversation_id = create_new_conversation(
+        user_id, bot_username, project_id, bot_id,
+        telegram_username=telegram_username,
+        telegram_first_name=telegram_first_name
+    )
+    
+    logger.info(f"📝 [Telegram] User {user_id} created new conversation after report (new conversation: {conversation_id})")
+    
     # Send report to API
     if APP_URL:
         try:
             reports_url = f"{APP_URL}/api/reports"
+            
             payload = {
                 "telegramUserId": user_id,
                 "username": username,
+                "botUsername": bot_username,  # Include bot username so reports can be filtered by project
                 "reportText": report_text,
+                "conversationHistory": conversation_history,  # Include conversation context
             }
             
-            logger.info(f"📤 [Report] Sending report from user {user_id} to {reports_url}")
+            logger.info(f"📤 [Report] Sending report from user {user_id} (@{username}) via bot @{bot_username} to {reports_url}")
             
             response = requests.post(
                 reports_url,
                 json=payload,
                 headers={"Content-Type": "application/json"},
                 timeout=10,
+                verify=SSL_VERIFY,
             )
             
             if response.ok:
                 logger.info(f"✅ [Report] Report successfully saved for user {user_id}")
                 await update.message.reply_text(
-                    "✅ Thank you for your report! It has been saved and will be reviewed."
+                    "✅ Thank you for your report! It has been saved and will be reviewed.\n\n"
+                    "You're starting with a fresh conversation. Send me a message to begin!"
                 )
             else:
                 logger.error(f"❌ [Report] Failed to save report: {response.status_code} - {response.text}")
                 await update.message.reply_text(
-                    "⚠️ Your report was received, but there was an issue saving it."
+                    "⚠️ Your report was received, but there was an issue saving it.\n\n"
+                    "You're starting with a fresh conversation. Send me a message to begin!"
                 )
         except Exception as e:
             logger.error(f"❌ [Report] Error sending report: {e}", exc_info=True)
             await update.message.reply_text(
-                "⚠️ There was an error sending your report, but it has been logged locally."
+                "⚠️ There was an error sending your report, but it has been logged locally.\n\n"
+                "You're starting with a fresh conversation. Send me a message to begin!"
             )
     else:
         logger.warning(f"📝 [Report] Report from user {user_id} (@{username}): {report_text}")
         await update.message.reply_text(
-            "✅ Your report has been logged. Thank you!"
+            "✅ Your report has been logged. Thank you!\n\n"
+            "You're starting with a fresh conversation. Send me a message to begin!"
         )
 
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /clear command - Clear chat history."""
+    """Handle /clear command - Clear chat history by creating a new conversation."""
+    bot_token = context.bot_data.get("bot_token")
+    if not bot_token:
+        await update.message.reply_text("❌ Bot configuration error. Please contact support.")
+        return
+    
     user_id = update.effective_user.id
     
-    # Get bot username
-    bot_info = await context.bot.get_me()
-    bot_username = bot_info.username if bot_info else None
+    # Look up bot info
+    bot_data = lookup_bot_by_token(bot_token)
+    if not bot_data:
+        await update.message.reply_text(
+            "❌ Bot configuration not found. Please configure this bot in the frontend first."
+        )
+        return
     
-    # Get bot username if not already retrieved
-    if not bot_username:
-        bot_info = await context.bot.get_me()
-        bot_username = bot_info.username if bot_info else "unknown"
+    bot_id = bot_data["botId"]
+    bot_username = bot_data["username"]
+    project_id = bot_data["projectId"]
     
-    # Get Telegram project
-    telegram_project_id = get_or_create_telegram_project(bot_username)
-    
-    # Create a new conversation (old one stays in DB, but we start fresh)
-    conversation_id = get_or_create_conversation(user_id, bot_username, telegram_project_id)
+    # Create a NEW conversation (old one stays in DB, but we start fresh)
+    # This ensures the frontend shows separate conversations before/after clear
+    telegram_username = update.effective_user.username
+    telegram_first_name = update.effective_user.first_name
+    conversation_id = create_new_conversation(
+        user_id, bot_username, project_id, bot_id,
+        telegram_username=telegram_username,
+        telegram_first_name=telegram_first_name
+    )
     
     logger.info(f"🗑️  [Telegram] User {user_id} cleared their conversation (new conversation: {conversation_id})")
     
@@ -1188,6 +1456,11 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle regular text messages."""
+    bot_token = context.bot_data.get("bot_token")
+    if not bot_token:
+        await update.message.reply_text("❌ Bot configuration error. Please contact support.")
+        return
+    
     user_id = update.effective_user.id
     text = update.message.text
     
@@ -1200,47 +1473,62 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
     
     try:
-        # Get bot username
-        bot_info = await context.bot.get_me()
-        bot_username = bot_info.username if bot_info else None
+        # Look up bot by token to get associated project
+        bot_data = lookup_bot_by_token(bot_token)
+        if not bot_data:
+            logger.error(f"❌ Bot not found in database. Please create the bot in the frontend first.")
+            await update.message.reply_text(
+                "❌ Bot configuration not found. Please configure this bot in the frontend first."
+            )
+            return
         
-        prefs = get_user_preferences(user_id)
-        model_id = prefs["model_id"]
+        bot_id = bot_data["botId"]
+        bot_username = bot_data["username"]
+        project_id = bot_data["projectId"]
+        project_data = bot_data["project"]
         
-        # Find project by model_id
-        project = find_project_by_model_id(model_id)
-        project_id = None
-        system_prompt = "You are a helpful assistant."  # Fallback
+        logger.info(f"✅ Using bot @{bot_username} for project {project_id}")
         
-        if project:
-            project_id = project["id"]
-            # Get system prompt from ProjectInstruction
-            project_system_prompt = get_project_system_prompt(project_id)
-            if project_system_prompt:
-                system_prompt = project_system_prompt
-            elif project.get("description"):
-                system_prompt = project["description"]
-            logger.info(f"📋 Using system prompt from project {project_id}")
+        # Get system prompt from project
+        system_prompt = project_data.get("systemPrompt") or project_data.get("description") or "You are a helpful assistant."
+        
+        # Get the project's config including trained model ID
+        # This ensures the bot uses the same finetuned model as the project
+        project_config = project_data.get("config") or {}
+        if not isinstance(project_config, dict):
+            project_config = {}
+        
+        trained_model_id = project_config.get("trainedModelId")
+        
+        # Use project's trained model, or fall back to base model if not trained yet
+        if trained_model_id:
+            model_id = trained_model_id
+            logger.info(f"🎯 Using project's TRAINED model: {model_id}")
         else:
-            logger.info(f"⚠️ No project found for model {model_id}, using fallback system prompt")
+            model_id = None  # Will use base model
+            logger.info(f"📋 Project has no trained model - using BASE model")
         
-        # Get or create Telegram bot project for conversations (named after bot username)
-        if not bot_username:
-            raise Exception("Bot username is required but not available")
+        # Get inference parameters from project config (with defaults)
+        temperature = project_config.get("temperature", DEFAULT_TEMPERATURE)
+        max_tokens = project_config.get("maxTokens", DEFAULT_MAX_TOKENS)
+        top_p = project_config.get("topP", DEFAULT_TOP_P)
         
-        telegram_project_id = get_or_create_telegram_project(bot_username)
+        logger.info(f"📋 Using bot's associated project {project_id}")
+        logger.info(f"🌡️  Inference params: temperature={temperature}, max_tokens={max_tokens}, top_p={top_p}")
         
-        # Get or create conversation for this user
-        conversation_id = get_or_create_conversation(user_id, bot_username, telegram_project_id)
+        # Get or create conversation for this user (tagged with source="bot")
+        # Include Telegram user info for better display in UI
+        telegram_username = update.effective_user.username
+        telegram_first_name = update.effective_user.first_name
+        conversation_id = get_or_create_conversation(
+            user_id, bot_username, project_id, bot_id,
+            telegram_username=telegram_username,
+            telegram_first_name=telegram_first_name
+        )
         
-        # Fetch tools from database - use the bot's project ID to get only tools associated with this bot
-        # If a user has selected a specific model/project, use that project's tools instead
-        tools_project_id = project_id if project_id else telegram_project_id
-        logger.info(f"🔧 [Telegram] Fetching tools for project: {tools_project_id}")
-        logger.info(f"   - User's model project ID: {project_id or 'None (using bot project)'}")
-        logger.info(f"   - Bot's project ID: {telegram_project_id}")
-        logger.info(f"   - Selected tools project ID: {tools_project_id}")
-        tools = fetch_tools_from_database(tools_project_id)
+        # Fetch tools from database - use the project ID
+        logger.info(f"🔧 [Telegram] Fetching tools for project: {project_id}")
+        tools = fetch_tools_from_database(project_id)
         logger.info(f"🔧 [Telegram] Retrieved {len(tools)} tool(s) for this conversation")
         tools_section = format_tools_for_system_prompt(tools)
         
@@ -1253,6 +1541,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.info(f"🤖 [Telegram] Model ID: {model_id or 'BASE MODEL'}")
         logger.info(f"📋 [Telegram] Project ID: {project_id or 'None (using fallback)'}")
         logger.info(f"🔧 [Telegram] Available tools: {len(tools)}")
+        
+        # Fetch conversation history BEFORE saving current message (last 10 messages, excluding tool calls/responses)
+        logger.info(f"📚 Fetching conversation history (last 10 messages)...")
+        conversation_history = fetch_conversation_history(conversation_id, limit=10)
+        logger.info(f"📚 Retrieved {len(conversation_history)} messages from history")
         
         # MESSAGE SAVING ORDER (CRITICAL - must match this exact sequence):
         # 1. Original query (user message)
@@ -1275,41 +1568,73 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else:
             logger.error(f"❌ STEP 1: FAILED to save user message to database!")
         
-        # Build formatted prompt
-        formatted_prompt = build_prompt(enhanced_system_prompt, text)
+        # Build formatted prompt with conversation history
+        formatted_prompt = build_prompt(enhanced_system_prompt, text, conversation_history)
         
         logger.info(f"📝 [Telegram] Formatted prompt length: {len(formatted_prompt)} chars")
         
         # First inference call
         # Use higher max_tokens if tools are available (tool calls can be long with nested JSON)
-        max_tokens_for_inference = prefs["max_tokens"]
+        max_tokens_for_inference = max_tokens
         if tools:
             # Increase max_tokens for tool calls to ensure closing tags aren't cut off
-            max_tokens_for_inference = max(prefs["max_tokens"], 500)
-            logger.info(f"🔧 Tools available - using max_tokens={max_tokens_for_inference} (increased from {prefs['max_tokens']}) to ensure tool calls complete")
+            max_tokens_for_inference = max(max_tokens, 500)
+            logger.info(f"🔧 Tools available - using max_tokens={max_tokens_for_inference} (increased from {max_tokens}) to ensure tool calls complete")
         
         result = call_modal_inference(
             formatted_prompt,
             model_id,
-            prefs["temperature"],
+            temperature,
             max_tokens_for_inference,
-            DEFAULT_TOP_P,
+            top_p,
         )
         
         if result.get("error"):
             logger.error(f"❌ [Telegram] Error: {result['error']}")
+            error_message = f"❌ Sorry, I encountered an error:\n\n`{result['error']}`\n\nPlease try again later or check your Modal endpoint."
+            
+            # Save error message to database so it appears in web app
+            logger.info(f"💾 Saving error message to database...")
+            error_message_id = save_message_to_db(
+                conversation_id=conversation_id,
+                role="assistant",
+                content=error_message,
+                bot_username=bot_username,
+                is_tool_call=False,
+                is_tool_response=False,
+                tokens_output=0
+            )
+            if error_message_id:
+                logger.info(f"✅ Error message saved to database (ID: {error_message_id})")
+            else:
+                logger.error(f"❌ FAILED to save error message to database!")
+            
             await update.message.reply_text(
-                f"❌ Sorry, I encountered an error:\n\n"
-                f"`{result['error']}`\n\n"
-                f"Please try again later or check your Modal endpoint.",
+                error_message,
                 parse_mode="Markdown",
             )
             return
         
         if not result.get("text") or not result["text"].strip():
-            await update.message.reply_text(
-                "⚠️ The model generated an empty response. Please try rephrasing your message."
+            empty_response_message = "⚠️ The model generated an empty response. Please try rephrasing your message."
+            
+            # Save empty response message to database
+            logger.info(f"💾 Saving empty response message to database...")
+            empty_message_id = save_message_to_db(
+                conversation_id=conversation_id,
+                role="assistant",
+                content=empty_response_message,
+                bot_username=bot_username,
+                is_tool_call=False,
+                is_tool_response=False,
+                tokens_output=0
             )
+            if empty_message_id:
+                logger.info(f"✅ Empty response message saved to database (ID: {empty_message_id})")
+            else:
+                logger.error(f"❌ FAILED to save empty response message to database!")
+            
+            await update.message.reply_text(empty_response_message)
             return
         
         response_text = result["text"]
@@ -1415,22 +1740,22 @@ CRITICAL RULES:
 - Present the information clearly
 - Be helpful and professional"""
                 
-                # Build follow-up prompt
-                follow_up_prompt = build_prompt(summary_system_prompt, f"{text}\n\n{summary_instruction}")
+                # Build follow-up prompt (include conversation history for context)
+                follow_up_prompt = build_prompt(summary_system_prompt, f"{text}\n\n{summary_instruction}", conversation_history)
                 logger.info(f"📝 Follow-up prompt length: {len(follow_up_prompt)} chars")
                 
                 logger.info(f"🔄 STEP 8: Running follow-up inference for natural response...")
                 logger.info(f"   - Model ID: {model_id or 'BASE MODEL'}")
-                logger.info(f"   - Temperature: {prefs['temperature']}")
-                logger.info(f"   - Max Tokens: {prefs['max_tokens']}")
+                logger.info(f"   - Temperature: {temperature}")
+                logger.info(f"   - Max Tokens: {max_tokens}")
                 
                 # Run follow-up inference
                 follow_up_result = call_modal_inference(
                     follow_up_prompt,
                     model_id,
-                    prefs["temperature"],
-                    prefs["max_tokens"],
-                    DEFAULT_TOP_P,
+                    temperature,
+                    max_tokens,
+                    top_p,
                 )
                 
                 logger.info(f"📥 Follow-up inference result:")
@@ -1496,17 +1821,383 @@ CRITICAL RULES:
             
     except Exception as e:
         logger.error(f"❌ [Telegram] Unexpected error: {e}", exc_info=True)
+        error_message = f"❌ An unexpected error occurred:\n\n`{str(e)}`\n\nPlease try again later."
+        
+        # Try to save error message to database if we have conversation context
+        try:
+            # Try to get conversation_id and bot_username from context if available
+            bot_token = context.bot_data.get("bot_token")
+            if bot_token:
+                bot_data = lookup_bot_by_token(bot_token)
+                if bot_data:
+                    bot_username = bot_data["username"]
+                    project_id = bot_data["projectId"]
+                    bot_id = bot_data["botId"]
+                    user_id = update.effective_user.id
+                    
+                    # Try to get existing conversation
+                    conversation_id = get_or_create_conversation(
+                        user_id, bot_username, project_id, bot_id,
+                        telegram_username=update.effective_user.username,
+                        telegram_first_name=update.effective_user.first_name
+                    )
+                    
+                    # Save error message to database
+                    logger.info(f"💾 Saving exception error message to database...")
+                    error_message_id = save_message_to_db(
+                        conversation_id=conversation_id,
+                        role="assistant",
+                        content=error_message,
+                        bot_username=bot_username,
+                        is_tool_call=False,
+                        is_tool_response=False,
+                        tokens_output=0
+                    )
+                    if error_message_id:
+                        logger.info(f"✅ Exception error message saved to database (ID: {error_message_id})")
+                    else:
+                        logger.error(f"❌ FAILED to save exception error message to database!")
+        except Exception as save_error:
+            logger.error(f"❌ Failed to save exception error to database: {save_error}")
+        
         await update.message.reply_text(
-            f"❌ An unexpected error occurred:\n\n"
-            f"`{str(e)}`\n\n"
-            f"Please try again later.",
+            error_message,
             parse_mode="Markdown",
         )
 
 
-def main() -> None:
-    """Start the bot."""
-    print("🤖 VibeTune Telegram Bot")
+class BotManager:
+    """Manages multiple bot instances with dynamic discovery."""
+    
+    def __init__(self):
+        self.running_bots: Dict[str, Any] = {}  # bot_id -> {"application": Application, "task": Task, "bot_info": dict}
+        self._shutdown_event = asyncio.Event()
+    
+    async def start_bot(self, bot_info: Dict[str, Any]) -> bool:
+        """
+        Start a single bot instance.
+        
+        Args:
+            bot_info: Bot info dict with token, username, projectId, etc.
+        
+        Returns:
+            True if bot started successfully, False otherwise
+        """
+        token = bot_info["token"]
+        username = bot_info["username"]
+        bot_id = bot_info["id"]
+        
+        # Skip if already running
+        if bot_id in self.running_bots:
+            logger.debug(f"⏭️  Bot @{username} (ID: {bot_id}) is already running")
+            return True
+        
+        logger.info(f"🚀 Starting bot instance: @{username} (ID: {bot_id})")
+        
+        try:
+            # Verify bot is still active and get full config
+            bot_data = lookup_bot_by_token(token)
+            if not bot_data:
+                logger.error(f"❌ Failed to lookup bot @{username} - skipping")
+                return False
+            
+            # Create application with bot token
+            application = Application.builder().token(token).build()
+            
+            # Store bot token in application context for handlers
+            application.bot_data["bot_token"] = token
+            application.bot_data["bot_id"] = bot_id
+            application.bot_data["bot_username"] = username
+            
+            # Add handlers
+            application.add_handler(CommandHandler("start", start_command))
+            application.add_handler(CommandHandler("help", help_command))
+            application.add_handler(CommandHandler("model", model_command))
+            application.add_handler(CommandHandler("base", base_command))
+            application.add_handler(CommandHandler("status", status_command))
+            application.add_handler(CommandHandler("report", report_command))
+            application.add_handler(CommandHandler("clear", clear_command))
+            
+            application.add_handler(
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+            )
+            
+            # Initialize and start polling
+            await application.initialize()
+            await application.start()
+            await application.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True
+            )
+            
+            # Create a task that waits for the updater to stop
+            async def polling_wrapper():
+                try:
+                    await application.updater.idle()
+                except asyncio.CancelledError:
+                    pass
+            
+            polling_task = asyncio.create_task(polling_wrapper())
+            
+            # Store bot instance
+            self.running_bots[bot_id] = {
+                "application": application,
+                "task": polling_task,
+                "bot_info": bot_info,
+            }
+            
+            logger.info(f"✅ Bot @{username} started successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error starting bot @{username}: {e}", exc_info=True)
+            return False
+    
+    async def stop_bot(self, bot_id: str) -> bool:
+        """
+        Stop a bot instance.
+        
+        Args:
+            bot_id: The bot ID to stop
+        
+        Returns:
+            True if bot stopped successfully, False otherwise
+        """
+        if bot_id not in self.running_bots:
+            return False
+        
+        bot_data = self.running_bots[bot_id]
+        username = bot_data["bot_info"]["username"]
+        
+        logger.info(f"🛑 Stopping bot @{username} (ID: {bot_id})")
+        
+        try:
+            application = bot_data["application"]
+            task = bot_data["task"]
+            
+            # Stop the updater
+            await application.updater.stop()
+            
+            # Stop the application
+            await application.stop()
+            await application.shutdown()
+            
+            # Cancel the polling task
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            
+            # Remove from running bots
+            del self.running_bots[bot_id]
+            
+            logger.info(f"✅ Bot @{username} stopped successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error stopping bot @{username}: {e}", exc_info=True)
+            # Remove from running bots even if shutdown failed
+            if bot_id in self.running_bots:
+                del self.running_bots[bot_id]
+            return False
+    
+    async def sync_bots(self) -> None:
+        """Check database for new/deactivated bots and sync running instances."""
+        try:
+            # Fetch all active bots from database
+            active_bots = fetch_all_active_bots()
+            active_bot_ids = {bot["id"] for bot in active_bots}
+            running_bot_ids = set(self.running_bots.keys())
+            
+            # Start new bots
+            for bot in active_bots:
+                if bot["id"] not in running_bot_ids:
+                    logger.info(f"🆕 New bot detected: @{bot['username']} (ID: {bot['id']})")
+                    await self.start_bot(bot)
+            
+            # Stop deactivated bots
+            for bot_id in running_bot_ids:
+                if bot_id not in active_bot_ids:
+                    logger.info(f"🔴 Bot deactivated: {bot_id}")
+                    await self.stop_bot(bot_id)
+            
+        except Exception as e:
+            logger.error(f"❌ Error syncing bots: {e}", exc_info=True)
+    
+    async def trigger_sync(self) -> Dict[str, Any]:
+        """
+        Manually trigger a bot sync (called by webhook).
+        
+        Returns:
+            Dict with sync results
+        """
+        try:
+            before_count = len(self.running_bots)
+            await self.sync_bots()
+            after_count = len(self.running_bots)
+            
+            return {
+                "success": True,
+                "message": "Bot sync completed",
+                "bots_before": before_count,
+                "bots_after": after_count,
+                "bots_added": after_count - before_count,
+            }
+        except Exception as e:
+            logger.error(f"❌ Error in manual sync: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e),
+            }
+    
+    async def shutdown(self) -> None:
+        """Shutdown all bots and stop monitoring."""
+        logger.info("🛑 Shutting down bot manager...")
+        
+        # Signal shutdown
+        self._shutdown_event.set()
+        
+        # Stop all bots
+        bot_ids = list(self.running_bots.keys())
+        for bot_id in bot_ids:
+            await self.stop_bot(bot_id)
+        
+        logger.info("✅ Bot manager shut down complete")
+
+
+async def run_bot_instance(bot_info: Dict[str, Any]) -> None:
+    """
+    Initialize and run a single bot instance (legacy function for backward compatibility).
+    
+    Args:
+        bot_info: Bot info dict with token, username, projectId, etc.
+    """
+    token = bot_info["token"]
+    username = bot_info["username"]
+    bot_id = bot_info["id"]
+    
+    logger.info(f"🚀 Starting bot instance: @{username} (ID: {bot_id})")
+    
+    try:
+        # Verify bot is still active and get full config
+        bot_data = lookup_bot_by_token(token)
+        if not bot_data:
+            logger.error(f"❌ Failed to lookup bot @{username} - skipping")
+            return
+        
+        # Create application with bot token
+        application = Application.builder().token(token).build()
+        
+        # Store bot token in application context for handlers
+        application.bot_data["bot_token"] = token
+        application.bot_data["bot_id"] = bot_id
+        application.bot_data["bot_username"] = username
+        
+        # Add handlers
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("model", model_command))
+        application.add_handler(CommandHandler("base", base_command))
+        application.add_handler(CommandHandler("status", status_command))
+        application.add_handler(CommandHandler("report", report_command))
+        application.add_handler(CommandHandler("clear", clear_command))
+        
+        application.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+        )
+        
+        logger.info(f"✅ Bot @{username} initialized successfully")
+        
+        # Run polling
+        await application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+        
+    except Exception as e:
+        logger.error(f"❌ Error running bot @{username}: {e}", exc_info=True)
+
+
+class WebhookHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for webhook endpoints."""
+    
+    def do_POST(self):
+        """Handle POST requests."""
+        if self.path == '/sync':
+            self.handle_sync()
+        else:
+            self.send_error(404)
+    
+    def do_GET(self):
+        """Handle GET requests."""
+        if self.path == '/sync':
+            self.handle_sync()
+        else:
+            self.send_error(404)
+    
+    def handle_sync(self):
+        """Handle sync webhook."""
+        global bot_manager_instance
+        
+        if bot_manager_instance is None:
+            self.send_json_response(
+                {"success": False, "error": "Bot manager not initialized"},
+                503
+            )
+            return
+        
+        try:
+            # Run sync in async context
+            # Get or create event loop for this thread
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
+            # Run the sync
+            result = loop.run_until_complete(bot_manager_instance.trigger_sync())
+            
+            status = 200 if result.get("success") else 500
+            self.send_json_response(result, status)
+        except Exception as e:
+            logger.error(f"❌ Error in webhook handler: {e}", exc_info=True)
+            self.send_json_response(
+                {"success": False, "error": str(e)},
+                500
+            )
+    
+    def send_json_response(self, data: Dict[str, Any], status: int = 200):
+        """Send JSON response."""
+        json_data = json.dumps(data).encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(json_data)))
+        self.end_headers()
+        self.wfile.write(json_data)
+    
+    def log_message(self, format, *args):
+        """Override to use our logger instead of default."""
+        logger.info(f"HTTP {format % args}")
+
+
+def start_webhook_server_thread(bot_manager: 'BotManager') -> Thread:
+    """Start HTTP server in a separate thread."""
+    global bot_manager_instance
+    bot_manager_instance = bot_manager
+    
+    def run_server():
+        server = HTTPServer(('0.0.0.0', WEBHOOK_PORT), WebhookHandler)
+        logger.info(f"🌐 Webhook server started on port {WEBHOOK_PORT}")
+        logger.info(f"   POST http://0.0.0.0:{WEBHOOK_PORT}/sync - Trigger bot sync")
+        server.serve_forever()
+    
+    thread = Thread(target=run_server, daemon=True)
+    thread.start()
+    return thread
+
+
+async def main_async() -> None:
+    """Main async function to run all bots with dynamic discovery."""
+    print("🤖 VibeTune Telegram Bot Server - Multi-Bot Mode")
     print("═══════════════════════════════════════")
     print(f"📡 Modal Endpoint: {MODAL_INFERENCE_URL}")
     print(f"🎯 Default Model: {DEFAULT_MODEL_ID}")
@@ -1516,25 +2207,91 @@ def main() -> None:
     print(f"🎯 Top P: {DEFAULT_TOP_P}")
     print(f"💾 Database: Connected")
     print("═══════════════════════════════════════")
-    print("✅ Bot is ready to receive messages!")
-    print("💡 Send /start to your bot to begin")
-    print()
     
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # Initialize bot manager
+    bot_manager = BotManager()
     
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("model", model_command))
-    application.add_handler(CommandHandler("base", base_command))
-    application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(CommandHandler("report", report_command))
-    application.add_handler(CommandHandler("clear", clear_command))
-    
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-    )
-    
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Fetch all active bots
+    if TELEGRAM_BOT_TOKEN:
+        # Backward compatibility: run single bot if token provided
+        logger.info(f"🔑 Single bot mode: Using provided token")
+        # Verify bot exists in database
+        bot_data = lookup_bot_by_token(TELEGRAM_BOT_TOKEN)
+        if not bot_data:
+            logger.error("❌ Bot not found in database. Please create the bot in the frontend first.")
+            print("")
+            print("To create a bot:")
+            print("  1. Go to Settings → Bots tab in the frontend")
+            print("  2. Create a bot and paste the token from BotFather")
+            print("  3. Make sure the bot is set to 'Active'")
+            print("")
+            return
+        bots = [{"token": TELEGRAM_BOT_TOKEN, "id": bot_data["botId"], "username": bot_data["username"]}]
+        
+        # Start the single bot
+        for bot in bots:
+            await bot_manager.start_bot(bot)
+        
+        # In single bot mode, just run the bot (no monitoring)
+        if bots:
+            await bot_manager.running_bots[bots[0]["id"]]["task"]
+    else:
+        # Multi-bot mode: fetch all active bots from database
+        logger.info(f"🔍 Multi-bot mode: Fetching active bots from database...")
+        bots = fetch_all_active_bots()
+        
+        if not bots:
+            logger.warning("⚠️  No active bots found in database!")
+            print("")
+            print("To create a bot:")
+            print("  1. Go to Settings → Bots tab in the frontend")
+            print("  2. Create a bot and get token from BotFather")
+            print("  3. The bot will automatically appear here when active")
+            print("")
+            print("💡 Bots are discovered via webhook when created in the frontend")
+            print("")
+        
+        # Start initial bots
+        for bot in bots:
+            await bot_manager.start_bot(bot)
+        
+        if bots:
+            print(f"✅ Started {len(bots)} bot(s) initially")
+            print("")
+            for idx, bot in enumerate(bots, 1):
+                print(f"  [{idx}] @{bot.get('username', 'unknown')} (ID: {bot['id']})")
+            print("")
+        
+        print("🔄 Dynamic bot discovery enabled")
+        print("💡 New bots created in the frontend will be automatically picked up via webhook!")
+        print(f"🌐 Webhook endpoint: http://0.0.0.0:{WEBHOOK_PORT}/sync")
+        print("💡 Send /start to any bot to begin")
+        print("")
+        
+        # Start webhook server in background thread (for immediate sync on bot creation)
+        webhook_thread = start_webhook_server_thread(bot_manager)
+        
+        # Keep the main thread alive - bots are managed via webhook updates
+        try:
+            # Wait indefinitely until shutdown signal
+            while not bot_manager._shutdown_event.is_set():
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("🛑 Received shutdown signal...")
+            bot_manager._shutdown_event.set()
+        finally:
+            # Shutdown gracefully
+            await bot_manager.shutdown()
+
+
+def main() -> None:
+    """Start the bot server."""
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        logger.info("🛑 Shutting down bot server...")
+    except Exception as e:
+        logger.error(f"❌ Fatal error: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
