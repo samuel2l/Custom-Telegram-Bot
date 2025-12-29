@@ -1020,7 +1020,7 @@ def execute_tool_call(tool_call: Dict[str, Any], tools: List[Dict[str, Any]], te
             logger.info(f"🌐 [execute_tool_call] Making GET request to: {url}")
             logger.info(f"🌐 [execute_tool_call] Request headers: {headers}")
             response = session.get(url, headers=headers, timeout=(5, 30))  # (connect timeout, read timeout)
-        else:
+        elif method == "POST":
             logger.info(f"🌐 [execute_tool_call] Making POST request to: {tool['endpoint']}")
             logger.info(f"🌐 [execute_tool_call] Request headers: {headers}")
             logger.info(f"📦 [execute_tool_call] Request body: {json.dumps(params, indent=2)}")
@@ -1028,7 +1028,67 @@ def execute_tool_call(tool_call: Dict[str, Any], tools: List[Dict[str, Any]], te
                 tool["endpoint"],
                 json=params,
                 headers=headers,
-                timeout=(5, 30)  # (connect timeout, read timeout)
+                timeout=(5, 150)  # (connect timeout, read timeout)
+            )
+        elif method == "PUT":
+            logger.info(f"🌐 [execute_tool_call] Making PUT request to: {tool['endpoint']}")
+            logger.info(f"🌐 [execute_tool_call] Request headers: {headers}")
+            logger.info(f"📦 [execute_tool_call] Request body: {json.dumps(params, indent=2)}")
+            response = session.put(
+                tool["endpoint"],
+                json=params,
+                headers=headers,
+                timeout=(5, 150)
+            )
+        elif method == "PATCH":
+            logger.info(f"🌐 [execute_tool_call] Making PATCH request to: {tool['endpoint']}")
+            logger.info(f"🌐 [execute_tool_call] Request headers: {headers}")
+            logger.info(f"📦 [execute_tool_call] Request body: {json.dumps(params, indent=2)}")
+            response = session.patch(
+                tool["endpoint"],
+                json=params,
+                headers=headers,
+                timeout=(5, 150)
+            )
+        elif method == "DELETE":
+            # For DELETE, params can be in query string or body depending on API design
+            # We'll support both: query params if it's a simple request, body if params are complex
+            if params and len(params) > 0:
+                # Check if we should use query params (simple key-value pairs) or body
+                has_complex_values = any(isinstance(v, (dict, list)) for v in params.values())
+                if has_complex_values:
+                    # Use body for complex data
+                    logger.info(f"🌐 [execute_tool_call] Making DELETE request to: {tool['endpoint']} (with body)")
+                    logger.info(f"🌐 [execute_tool_call] Request headers: {headers}")
+                    logger.info(f"📦 [execute_tool_call] Request body: {json.dumps(params, indent=2)}")
+                    response = session.delete(
+                        tool["endpoint"],
+                        json=params,
+                        headers=headers,
+                        timeout=(5, 150)
+                    )
+                else:
+                    # Use query params for simple data
+                    url_params = "&".join([f"{k}={requests.utils.quote(str(v))}" for k, v in params.items()])
+                    url = f"{tool['endpoint']}?{url_params}" if url_params else tool["endpoint"]
+                    logger.info(f"🌐 [execute_tool_call] Making DELETE request to: {url}")
+                    logger.info(f"🌐 [execute_tool_call] Request headers: {headers}")
+                    response = session.delete(url, headers=headers, timeout=(5, 150))
+            else:
+                # No params, just delete the endpoint
+                logger.info(f"🌐 [execute_tool_call] Making DELETE request to: {tool['endpoint']}")
+                logger.info(f"🌐 [execute_tool_call] Request headers: {headers}")
+                response = session.delete(tool["endpoint"], headers=headers, timeout=(5, 150))
+        else:
+            logger.warning(f"⚠️  [execute_tool_call] Unsupported HTTP method: {method}, defaulting to POST")
+            logger.info(f"🌐 [execute_tool_call] Making POST request to: {tool['endpoint']}")
+            logger.info(f"🌐 [execute_tool_call] Request headers: {headers}")
+            logger.info(f"📦 [execute_tool_call] Request body: {json.dumps(params, indent=2)}")
+            response = session.post(
+                tool["endpoint"],
+                json=params,
+                headers=headers,
+                timeout=(5, 150)
             )
         
         logger.info(f"📡 [execute_tool_call] Response status: {response.status_code} {response.reason}")
@@ -1048,10 +1108,28 @@ def execute_tool_call(tool_call: Dict[str, Any], tools: List[Dict[str, Any]], te
         if not response.ok:
             error_text = response.text
             logger.error(f"❌ [execute_tool_call] API error: {response.status_code} - {error_text}")
+            
+            # Try to parse error message from JSON response
+            error_data = {}
+            actual_error_message = None
+            try:
+                if error_text:
+                    error_data = json.loads(error_text)
+                    # Extract error message from various possible fields
+                    actual_error_message = (
+                        error_data.get("error") or 
+                        error_data.get("message") or 
+                        error_data.get("detail") or
+                        error_text
+                    )
+            except:
+                # If not JSON, use the text as-is
+                actual_error_message = error_text
+            
             return {
                 "success": False,
-                "data": {"error": f"API error: {response.status_code}"},
-                "error": error_text
+                "data": {"error": actual_error_message or f"API error: {response.status_code}"},
+                "error": actual_error_message or error_text
             }
         
         # Parse response
@@ -1195,7 +1273,7 @@ def call_modal_inference(
             inference_url,
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=(10, 60),  # (connect timeout, read timeout) - 10s to connect, 60s to read
+            timeout=(10, 150),  # (connect timeout, read timeout) - 10s to connect, 60s to read
         )
         
         request_end = time.time()
@@ -1705,7 +1783,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # Fetch conversation history for context (excluding tool calls/responses)
         # This helps the model see previous messages and extract missing parameters
         # TEMPORARILY DISABLED FOR TESTING - set limit=0 to disable, limit=10 to re-enable
-        conversation_history = fetch_conversation_history(conversation_id, limit=0)
+        conversation_history = fetch_conversation_history(conversation_id, limit=10)
         # Exclude the current message from history (it will be added separately)
         if conversation_history:
             # Remove the last message if it's the same as current (shouldn't happen, but safety check)
@@ -1992,11 +2070,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 
                 # Build follow-up prompt for natural language response
                 logger.info(f"🔄 STEP 8: Building follow-up prompt for natural language response...")
+                
+                # Extract error message if there's an error
+                error_message = None
+                if not tool_result["success"]:
+                    response_data = tool_result.get("data", {})
+                    # Try to extract the actual error message from various possible structures
+                    if isinstance(response_data, dict):
+                        error_message = (
+                            response_data.get("error") or 
+                            response_data.get("message") or 
+                            response_data.get("detail") or
+                            tool_result.get("error")
+                        )
+                    else:
+                        error_message = tool_result.get("error")
+                
+                # Format results for the prompt
+                results_data = tool_result["data"] if tool_result["success"] else {
+                    "error": error_message or "An unknown error occurred"
+                }
+                
                 summary_instruction = f"""
 IMPORTANT: The tool has been executed and returned results. You MUST now provide a natural language summary of the results below. Do NOT make another tool call. Do NOT output JSON. Write a friendly, conversational response presenting the data.
 
 Tool: {tool_call["name"]}
-Results: {json.dumps(tool_result["data"], indent=2)}
+Results: {json.dumps(results_data, indent=2)}
 
 Now respond naturally to the user based on these results:"""
                 
@@ -2009,7 +2108,11 @@ CRITICAL RULES:
 - Do NOT use <tool_call> tags
 - Write in plain conversational English
 - Present the information clearly
-- Be helpful and professional"""
+- Be helpful and professional
+- If there's an error, explain what actually went wrong in simple terms - extract the actual error message and explain it naturally
+- Do NOT mention HTTP status codes (like 400, 500, etc.) - they are technical details the user doesn't need
+- Focus on what the error means for the user and what they can do about it
+- If the error message says something specific (like "Driver is too far from delivery locations"), explain that exact issue clearly"""
                 
                 # Build follow-up prompt (include conversation history for context)
                 follow_up_prompt = build_prompt(summary_system_prompt, f"{text}\n\n{summary_instruction}", conversation_history)
