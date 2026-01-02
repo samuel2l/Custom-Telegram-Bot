@@ -207,6 +207,42 @@ def get_user_preferences(user_id: int) -> Dict[str, any]:
     return user_preferences[user_id]
 
 
+def strip_think(text: str) -> str:
+    """
+    Remove thinking/reasoning tags from model output.
+    Matches the JavaScript stripThink function in src/lib/rag.ts exactly.
+    
+    The model outputs thinking tags with mismatched opening/closing:
+    - Opening: <think>
+    - Closing: </think>
+    
+    This function removes ALL thinking content, leaving only the final answer.
+    
+    Args:
+        text: The text that may contain thinking tags
+        
+    Returns:
+        Text with all thinking tags removed - only the final answer remains
+    """
+    if not text:
+        return ""
+    
+    # Remove paired tags: <think>...</think> (matches JavaScript exactly - mismatched tags)
+    text = re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.IGNORECASE)
+    
+    # Remove unclosed tags at the end: <think>...end of text
+    text = re.sub(r'<think>[\s\S]*$', '', text, flags=re.IGNORECASE)
+    
+    # Remove closing tags without opening tags (orphaned closing tags): start...</think>
+    text = re.sub(r'^[\s\S]*?</think>', '', text, flags=re.IGNORECASE)
+    
+    # Also handle standard <think>...</think> pattern (common variant)
+    text = re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'<think>[\s\S]*$', '', text, flags=re.IGNORECASE)
+    
+    return text.strip()
+
+
 def find_project_by_model_id(model_id: Optional[str]) -> Optional[Dict[str, Any]]:
     """Find a project that uses the given trainedModelId."""
     if not model_id:
@@ -1893,7 +1929,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text(empty_response_message)
             return
         
-        response_text = result["text"]
+        raw_response_text = result["text"]
+        response_text = strip_think(raw_response_text)
         tokens = result.get("tokens", 0)
         
         logger.info("=" * 60)
@@ -2140,7 +2177,8 @@ CRITICAL RULES:
                     final_response = f"I executed the tool '{tool_call['name']}' and got these results:\n\n{json.dumps(tool_result['data'], indent=2)}"
                     logger.info(f"⚠️  Using fallback response (tool execution failed)")
                 else:
-                    final_response = follow_up_result.get("text", "").strip()
+                    raw_response = follow_up_result.get("text", "").strip()
+                    final_response = strip_think(raw_response)
                     logger.info(f"✅ Natural language response received ({len(final_response)} chars)")
                     logger.info(f"📄 Response preview: {final_response[:200]}...")
                 
